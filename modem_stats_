@@ -1,0 +1,586 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2019 John Vinopal
+# Licensed under the MIT license.
+#
+# MUNIN Plugin reporting statistics for the
+# ATT Pace 5268AC ADSL Modem
+#
+# TODO:
+#    * COUNTER vs DERIVE for packets, errors?
+#
+# Requirements:
+#    Perl
+#    Bundle::LWP
+#
+# Configuration:
+#   Sample setup for '/usr/local/etc/munin/plugin-conf.d/local.conf':
+#
+#   [modem_stats_*]
+#   env.modem_addr 192.168.0.1
+#   env.proxy http://some.host:port/
+#
+# Usage:
+#    ln -s .../modem_stats_ /usr/local/etc/munin/plugins/modem_stats_(reportname)
+#
+# Reports supported:
+#
+#    uptime         - time since reboot in days
+#    version        - ATT config versions (silently updated)
+#    speed          - DSL line rates
+#    snr            - DSL line metrics
+#    wanbytes       - WAN traffic in bytes
+#    wanpackets     - WAN traffic in packets
+#    wanerrors      - WAN packet errors
+#    lanbytes       - LAN traffic in bytes
+#    lanpackets     - LAN traffic in packets
+#    lanerrors      - LAN packet errors
+#    TODO - landiscards
+#    wifibytes      - WIFI traffic in bytes
+#    wifipackets    - WIFI traffic in packets
+#    wifierrors     - WIFI packet errors
+#    TODO - wifidiscards
+#
+# Parameters supported:
+#
+#    config
+#    autoconf
+#
+# Magic markers:
+#%# family=auto
+#%# capabilities=autoconf
+
+use warnings;
+use strict;
+use utf8;
+use Munin::Plugin;
+
+# Default values for Munin config graph_NNN variables.
+my $DEFAULT_MODEM_ADDR = "192.168.0.1";
+my $DEFAULT_GRAPH_ARGS = "--base 1000 -l 0";
+my $DEFAULT_GRAPH_CATEGORY = "modem";
+
+# Use modem addr specified in config file or default.
+my $MODEM_ADDR = $ENV{modem_addr} || $DEFAULT_MODEM_ADDR;
+
+# Extract report name from filename: modem_stats_(REPORTNAME)
+my ($REPORT_NAME) = $0 =~ /_([^_]+)$/;
+
+my $lwp_loaded = 1;
+if (! eval "require LWP::UserAgent;") {
+    $lwp_loaded = undef;
+}
+
+# The various modem reports this plugin knows about.
+# Specified in the filename as: modem_stats_REPORTNAME
+my %reports = (
+    speed => {
+        url =>        "xslt?PAGE=C_1_0",
+        function =>   \&fetchSettingsBroadbandStatus,
+        title =>      "Modem Speed Statistics",
+        category =>   "modem"
+    },
+    snr => {
+        url =>        "xslt?PAGE=C_1_0",
+        function =>   \&fetchSettingsBroadbandStatus,
+        title =>      "Modem SNR Statistics",
+        category =>   "modem"
+    },
+    wanbytes => {
+        url =>        "xslt?PAGE=C_1_0",
+        function =>   \&fetchSettingsBroadbandStatus,
+        title =>      "WAN Traffic",
+        graph_category =>   "wan",
+    },
+    wanpackets => {
+        url =>        "xslt?PAGE=C_1_0",
+        function =>   \&fetchSettingsBroadbandStatus,
+        title =>      "WAN PPS",
+        graph_category =>   "wan"
+    },
+    wanerrors => {
+        url =>        "xslt?PAGE=C_1_0",
+        function =>   \&fetchSettingsBroadbandStatus,
+        title =>      "WAN Errors",
+        graph_category =>   "wan"
+    },
+    lanbytes => {
+        url =>        "xslt?PAGE=C_2_5",
+        function =>   \&fetchSettingsLanStatistics,
+        title =>      "Ethernet Traffic",
+        graph_category =>   "network",
+    },
+    lanpackets => {
+        url =>        "xslt?PAGE=C_2_5",
+        function =>   \&fetchSettingsLanStatistics,
+        title =>      "Ethernet PPS",
+        graph_category =>   "network"
+    },
+    lanerrors => {
+        url =>        "xslt?PAGE=C_2_5",
+        function =>   \&fetchSettingsLanStatistics,
+        title =>      "Ethernet Errors",
+        graph_category =>   "network"
+    },
+    wifibytes => {
+        url =>        "xslt?PAGE=C_2_5",
+        function =>   \&fetchSettingsLanStatistics,
+        title =>      "WiFi Traffic",
+        graph_category =>   "network",
+    },
+    wifipackets => {
+        url =>        "xslt?PAGE=C_2_5",
+        function =>   \&fetchSettingsLanStatistics,
+        title =>      "WiFi PPS",
+        graph_category =>   "network"
+    },
+    wifierrors => {
+        url =>        "xslt?PAGE=C_2_5",
+        function =>   \&fetchSettingsLanStatistics,
+        title =>      "WiFi Errors",
+        graph_category =>   "network"
+    },
+    uptime => {
+        url =>        "xslt?PAGE=C_0_0",
+        function =>   \&fetchSettingsSystemInfoStatus,
+        title =>      "Modem Uptime Statistics",
+        graph_category =>   "system"
+    },
+    version => {
+        url =>        "xslt?PAGE=C_0_0",
+        function =>   \&fetchSettingsSystemInfoStatus,
+        title =>      "Modem Software Version",
+        graph_category =>   "system"
+    }
+);
+
+# MUNIN AUTOCONFIGURATION
+if (defined $ARGV[0] and $ARGV[0] eq "autoconf") {
+    # Check for requirements.
+    my $ret = '';
+    if (! $lwp_loaded) {
+        $ret .= "Not found: LWP::UserAgent";
+    }
+    if (not exists $reports{$REPORT_NAME}) {
+        $ret .= ", " if ($ret);
+        $ret .= "No such report: '$REPORT_NAME'";
+    }
+    # Emit autoconf details.
+    if ($ret) {
+        print "no ($ret)\n";
+        exit 1;
+    }
+    print "yes\n";
+    exit 0;
+}
+
+# fail fast.
+die "unknown modem hostname\n" if (not defined $MODEM_ADDR);
+die "unknown report: '$REPORT_NAME'\n" if (not exists $reports{$REPORT_NAME});
+
+# MUNIN CONFIG
+if (defined $ARGV[0] and $ARGV[0] eq 'config') {
+    print "graph_title $reports{$REPORT_NAME}->{title}\n";
+    print "graph_args ", $reports{$REPORT_NAME}->{graph_args} || $DEFAULT_GRAPH_ARGS, "\n";
+    print "graph_category ", $reports{$REPORT_NAME}->{graph_category} || $DEFAULT_GRAPH_CATEGORY, "\n";
+    print "graph_info This graph shows ", $reports{$REPORT_NAME}->{title}, " from the modem at $MODEM_ADDR.\n";
+    print "host_name $MODEM_ADDR\n" unless $MODEM_ADDR eq 'localhost';
+    # Display configuration for the desired report.
+    &{$reports{$REPORT_NAME}->{function}}($REPORT_NAME, 'config');
+    exit 0;
+}
+
+# Produce data for the desired report.
+&{$reports{$REPORT_NAME}->{function}}($REPORT_NAME, '');
+exit 0;
+
+
+#########################################################################
+# REPORT CONFIG/DATA GENERATION
+#########################################################################
+
+# Settings Page: /xslt?PAGE=C_0_0
+# Uptime
+# Software Version
+sub fetchSettingsSystemInfoStatus {
+    die if (@_ != 2);
+    my $report = shift;
+    my $config = shift;
+
+    # Valid reports and variables for each.
+    my %report_vars = (
+        uptime => {
+            type   => 'GAUGE',
+            draw   => 'AREA',
+            scale  => 'no',
+            vlabel => 'days',
+            vars =>   ['uptime'],
+            labels => ['Uptime'],
+        },
+        version => {
+            type   => 'GAUGE',
+            scale => 'no',
+            vlabel => 'software version',
+            vars   => ['config_version', 'eapol_cert_version', 'cms_cert_version'],
+            labels => ['Config', 'EAPOL_CERT', 'CMS_CERT']
+        }
+    );
+
+    # Fail fast.
+    die "unknown report: $report\n" if (not exists $report_vars{$report});
+
+    # Configuration
+    if ($config) {
+        print "graph_vlabel $report_vars{$report}->{vlabel}\n" if ($report_vars{$report}->{vlabel});
+        print "graph_scale $report_vars{$report}->{scale}\n" if ($report_vars{$report}->{scale});
+        for (my $i = 0; $i < @{$report_vars{$report}->{vars}}; $i++) {
+            $_ = $report_vars{$report}->{vars}->[$i];
+            print "$_.label $report_vars{$report}->{labels}->[$i]\n";
+            print "$_.min 0\n";
+            print "$_.draw $report_vars{$report}->{draw}\n" if ($report_vars{$report}->{draw});
+            print "$_.type $report_vars{$report}->{type}\n" if ($report_vars{$report}->{type});
+            print "$_.cdef $report_vars{$report}->{cdef}->[$i]\n" if ($report_vars{$report}->{cdef}->[$i]);
+            print "$_.graph $report_vars{$report}->{graph}->[$i]\n" if ($report_vars{$report}->{graph}->[$i]);
+            print "$_.negative $report_vars{$report}->{negative}->[$i]\n" if ($report_vars{$report}->{negative}->[$i]);
+        }
+        return;
+    }
+
+    # Extract the following variables.
+    my %fields = (uptime => 'Time Since Last Boot', config_version => "att_unified_config", eapol_cert_version => "att_unified_eapol-certs", cms_cert_version => "att_unified_cms-certs");
+
+    # Parse data out of html tables...
+    my $parser = sub {
+        my $html = shift;
+        my %vals = ();
+        foreach my $field (keys %fields) {
+            my $fieldLabel = $fields{$field};
+            # format is <td ...>LABEL</td>\n<td>VALUE</td>
+            my ($val) = $html =~ m#<td[^>]*>$fieldLabel</td>\s+<td[^>]*>(.*?)</td>#;
+            $vals{$field} = defined $val ? $val : 'U';
+        }
+
+        # Normalize Time_Since_Last_Boot into seconds
+        # "94 days 13:33:31" or "0 day 0:14:23"
+        if ($vals{uptime} ne 'U') {
+            my ($days, $hours, $min, $sec) = $vals{uptime} =~ m#(\d+) days? (\d+):(\d+):(\d+)#;
+            $vals{uptime} = sprintf "%.03f", $days + (($sec + (60*$min) + (3600*$hours))/86400);
+        }
+        return %vals;
+    };
+
+    # Output system uptime.
+    my %vals = fetchParsedData($report, $parser);
+    foreach (@{$report_vars{$report}->{vars}}) {
+        print "$_.value $vals{$_}\n";
+    }
+}
+
+# Broadband Page: /xslt?PAGE=C_1_0
+# DSL statistics for LINE1 and LINE2
+# WAN Bytes, Packets, Errors
+sub fetchSettingsBroadbandStatus {
+    die if (@_ != 2);
+    my $report = shift;
+    my $config = shift;
+
+    # Valid reports and variables for each.
+    my %report_vars = (
+        speed => {
+            vlabel => 'Kbps',
+            vars =>   [qw(user_rate_line1_d user_rate_line1_u user_rate_line2_d user_rate_line2_u)],
+            labels => ['Line1 Down', 'Line1 Up', 'Line2 Down', 'Line2 Up'],
+        },
+        snr => {
+            vlabel => 'dB',
+            vars =>   [qw(
+              noise_margin_line1_d noise_margin_line1_u attenuation_line1_d attenuation_line1_u power_line1_d power_line1_u
+              noise_margin_line2_d noise_margin_line2_u attenuation_line2_d attenuation_line2_u power_line2_d power_line2_u
+            )],
+            labels => [
+              'Line1 SNR Down', 'Line1 SNR Up', 'Line1 Attn. Down', 'Line1 Attn. Up', 'Line1 Power Down', 'Line1 Power Up',
+              'Line2 SNR Down', 'Line2 SNR Up', 'Line2 Attn. Down', 'Line2 Attn. Up', 'Line2 Power Down', 'Line2 Power Up'
+            ],
+        },
+        wanbytes => {
+            type => 'DERIVE',
+            vlabel => 'bytes per ${graph_period} in (-) / out (+)',
+            vars => [qw(bytes_d bytes_u)],
+            labels => ['received', 'bps'],
+            graph => ['no', undef],
+            negative => [undef, 'bytes_d']
+        },
+        wanpackets => {
+            type => 'COUNTER',
+            vlabel => 'packets per ${graph_period} in (-) / out (+)',
+            vars => [qw(packets_d packets_u)],
+            labels => ['received', 'bps'],
+            graph => ['no', undef],
+            negative => [undef, 'packets_d']
+        },
+        wanerrors => {
+            type => 'COUNTER',
+            vlabel => 'errors per ${graph_period}',
+            vars => [qw(errors_d errors_u)],
+            labels => ['Errors Down', 'Errors Up'],
+        }
+    );
+
+    # Fail fast.
+    die "unknown report: $report\n" if (not exists $report_vars{$report});
+
+    # Extract the following variables.
+    my %lines = (line1 => 'Line 1', line2 => 'Line 2');
+    my %linefields = (user_rate => 'User Rate', noise_margin => 'Noise Margin', attenuation => 'Attenuation', power => 'Output Power');
+
+    # Parse data out of html tables...
+    my $parser = sub {
+        my $html = shift;
+        my %jsvals = ();
+
+        # Parse data for LINE1 and LINE2 out of the respective tables.
+        for my $line (keys %lines) {
+            my $linelabel = $lines{$line};
+            for my $varname (keys %linefields) {
+                my $varlabel = $linefields{$varname};
+                my ($var_d, $var_u) = $html =~
+                  m#$linelabel.*?<td>$varlabel</td>\s+<td>([\d.]+)[^<]*</td>\s+<td>([\d.]+)[^<]*</td>#s;
+                # print STDERR "DEBUG $varlabel $linelabel $var_d $var_u\n";
+                # variables are named CATEGORY_LINE_DIRECTION: power_line1_u
+                $jsvals{$varname . '_' . $line . '_d'} = $var_d;
+                $jsvals{$varname . '_' . $line . '_u'} = $var_u;
+            }
+        }
+
+        # IP Traffic Transmit
+        my ($bytes_u, $packets_u, $errors_u) = $html =~ m#>Transmit</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>#s;
+        $jsvals{'bytes_u'} = $bytes_u //= 'U';
+        $jsvals{'packets_u'} = $packets_u //= 'U';
+        $jsvals{'errors_u'} = $errors_u //= 'U';
+
+        # IP Traffic Receive
+        my ($bytes_d, $packets_d, $errors_d) = $html =~ m#>Receive</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>#s;
+        $jsvals{'bytes_d'} = $bytes_d //= 'U';
+        $jsvals{'packets_d'} = $packets_d //= 'U';
+        $jsvals{'errors_d'} = $errors_d //= 'U';
+
+        return %jsvals;
+    };
+
+    # Configuration
+    if ($config) {
+        print "graph_vlabel $report_vars{$report}->{vlabel}\n" if ($report_vars{$report}->{vlabel});
+        print "graph_scale $report_vars{$report}->{scale}\n" if ($report_vars{$report}->{scale});
+        for (my $i = 0; $i < @{$report_vars{$report}->{vars}}; $i++) {
+            $_ = $report_vars{$report}->{vars}->[$i];
+            print "$_.label $report_vars{$report}->{labels}->[$i]\n";
+            print "$_.min 0\n";
+            print "$_.draw $report_vars{$report}->{draw}\n" if ($report_vars{$report}->{draw});
+            print "$_.type $report_vars{$report}->{type}\n" if ($report_vars{$report}->{type});
+            print "$_.cdef $report_vars{$report}->{cdef}->[$i]\n" if ($report_vars{$report}->{cdef}->[$i]);
+            print "$_.graph $report_vars{$report}->{graph}->[$i]\n" if ($report_vars{$report}->{graph}->[$i]);
+            print "$_.negative $report_vars{$report}->{negative}->[$i]\n" if ($report_vars{$report}->{negative}->[$i]);
+        }
+        return;
+    }
+
+    # Output values for report
+    my %vals = fetchParsedData($report, $parser);
+    foreach (@{$report_vars{$report}->{vars}}) {
+        print "$_.value $vals{$_}\n";
+    }
+}
+
+# LAN Statistics Page: xslt?PAGE=C_2_5
+# Ethernet Bytes, Packets, Errors
+# Wifi Bytes, Packets, Errors
+sub fetchSettingsLanStatistics {
+    die if (@_ != 2);
+    my $report = shift;
+    my $config = shift;
+
+    # Valid reports and variables for each.
+    my %report_vars = (
+        lanbytes => {
+            type => 'DERIVE',
+            vlabel => 'bytes per ${graph_period} in (-) / out (+)',
+            vars =>   [qw(bytes_port1_d bytes_port1_u bytes_port2_d bytes_port2_u bytes_port3_d bytes_port3_u bytes_port4_d bytes_port4_u)],
+            labels => ['Port1 Down', 'Port1 Up', 'Port2 Down', 'Port2 Up', 'Port3 Down', 'Port3 Up', 'Port4 Down', 'Port4 Up'],
+            graph => ['no', undef, 'no', undef, 'no', undef, 'no', undef],
+            negative => [undef, 'bytes_port1_d', undef, 'bytes_port2_d', undef, 'bytes_port3_d', undef, 'bytes_port4_d']
+        },
+        lanpackets => {
+            type => 'COUNTER',
+            vlabel => 'packets per ${graph_period} in (-) / out (+)',
+            vars =>   [qw(packets_port1_d packets_port1_u packets_port2_d packets_port2_u packets_port3_d packets_port3_u packets_port4_d packets_port4_u)],
+            labels => ['Port1 Down', 'Port1 Up', 'Port2 Down', 'Port2 Up', 'Port3 Down', 'Port3 Up', 'Port4 Down', 'Port4 Up'],
+            graph => ['no', undef, 'no', undef, 'no', undef, 'no', undef],
+            negative => [undef, 'packets_port1_d', undef, 'packets_port2_d', undef, 'packets_port3_d', undef, 'packets_port4_d']
+        },
+        lanerrors => {
+            type => 'COUNTER',
+            vlabel => 'errors per ${graph_period}',
+            vars =>   [qw(errors_port1_d errors_port1_u errors_port2_d errors_port2_u errors_port3_d errors_port3_u errors_port4_d errors_port4_u)],
+            labels => ['Port1 Down', 'Port1 Up', 'Port2 Down', 'Port2 Up', 'Port3 Down', 'Port3 Up', 'Port4 Down', 'Port4 Up'],
+        },
+        # landiscards => {},
+        wifibytes => {
+            type => 'DERIVE',
+            vlabel => 'bytes per ${graph_period} in (-) / out (+)',
+            vars =>   [qw(bytes_5g_d bytes_5g_u bytes_2g_d bytes_2g_u)],
+            labels => ['5Ghz Down', '5Ghz Up', '2.4Ghz Down', '2.4Ghz Up'],
+            graph => ['no', undef, 'no', undef],
+            negative => [undef, 'bytes_5g_d', undef, 'bytes_2g_d']
+        },
+        wifipackets => {
+            type => 'COUNTER',
+            vlabel => 'packets per ${graph_period} in (-) / out (+)',
+            vars =>   [qw(packets_5g_d packets_5g_u packets_2g_d packets_2g_u)],
+            labels => ['5Ghz Down', '5Ghz Up', '2.4Ghz Down', '2.4Ghz Up'],
+            graph => ['no', undef, 'no', undef],
+            negative => [undef, 'packets_5g_d', undef, 'packets_2g_d']
+        },
+        wifierrors => {
+            type => 'COUNTER',
+            vlabel => 'errors per ${graph_period}',
+            vars =>   [qw(errors_5g_d errors_5g_u errors_2g_d errors_2g_u)],
+            labels => ['5Ghz Down', '5Ghz Up', '2.4Ghz Down', '2.4Ghz Up'],
+        },
+        # wifidiscards => {},
+    );
+
+    # 4 ports, TX/RX, 4 data fields. Eg: "PORT1TX BYTE"
+    my %ports = (port1 => 'Port1', port2 => 'Port2', port3 => 'Port3', port4 => 'Port4');
+    my %directions = ('u' => 'TX', 'd' => 'RX');
+    my %fields = (bytes => 'BYTE', packets => 'PKT', errors => 'ERR', discards => 'DIS');
+
+    # Parse data out of html tables...
+    my $parser = sub {
+        my $html = shift;
+        my %jsvals = ();
+
+        # Extract LAN Ethernet data from the PORTS table.
+        for my $port (keys %ports) {
+            my $portlabel = $ports{$port};
+            for my $direction (keys %directions) {
+                my $dirlabel = $directions{$direction};
+                for my $field (keys %fields) {
+                    my $fieldlabel = $fields{$field};
+                    my ($val) = $html =~ m#<td headers="PORTS $portlabel$dirlabel $fieldlabel">(\d*)</td>#;
+                    # DEBUG
+                    # print STDERR "Looking for 'PORTS $portlabel$dirlabel $fieldlabel' => '$val'\n";
+                    $jsvals{$field . '_' . $port . '_' . $direction} = defined $val ? $val : 'U';
+                }
+            }
+        }
+
+        # Wifi 5GHz Traffic Transmit
+        my ($bytes_5g_u, $packets_5g_u, $errors_5g_u) = $html =~ m#5GHz</td>.*? Transmit</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>#s;
+        $jsvals{'bytes_5g_u'} = $bytes_5g_u //= 'U';
+        $jsvals{'packets_5g_u'} = $packets_5g_u //= 'U';
+        $jsvals{'errors_5g_u'} = $errors_5g_u //= 'U';
+
+        # Wifi 5GHz Traffic Receive
+        my ($bytes_5g_d, $packets_5g_d, $errors_5g_d) = $html =~ m#5GHz</td>.*? Receive</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>#s;
+        $jsvals{'bytes_5g_d'} = $bytes_5g_d //= 'U';
+        $jsvals{'packets_5g_d'} = $packets_5g_d //= 'U';
+        $jsvals{'errors_5g_d'} = $errors_5g_d //= 'U';
+
+        # Wifi 2.4GHz Traffic Transmit
+        my ($bytes_2g_u, $packets_2g_u, $errors_2g_u) = $html =~ m#2\.4GHz</td>.*? Transmit</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>#s;
+        $jsvals{'bytes_2g_u'} = $bytes_2g_u //= 'U';
+        $jsvals{'packets_2g_u'} = $packets_2g_u //= 'U';
+        $jsvals{'errors_2g_u'} = $errors_2g_u //= 'U';
+
+        # Wifi 2.4GHz Traffic Receive
+        my ($bytes_2g_d, $packets_2g_d, $errors_2g_d) = $html =~ m#2\.4GHz</td>.*? Receive</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>.*?<td>(\d+)</td>#s;
+        $jsvals{'bytes_2g_d'} = $bytes_2g_d //= 'U';
+        $jsvals{'packets_2g_d'} = $packets_2g_d //= 'U';
+        $jsvals{'errors_2g_d'} = $errors_2g_d //= 'U';
+
+        return %jsvals;
+    };
+
+    # Configuration
+    if ($config) {
+        print "graph_vlabel $report_vars{$report}->{vlabel}\n" if ($report_vars{$report}->{vlabel});
+        print "graph_scale $report_vars{$report}->{scale}\n" if ($report_vars{$report}->{scale});
+        for (my $i = 0; $i < @{$report_vars{$report}->{vars}}; $i++) {
+            $_ = $report_vars{$report}->{vars}->[$i];
+            print "$_.label $report_vars{$report}->{labels}->[$i]\n";
+            print "$_.min 0\n";
+            print "$_.draw $report_vars{$report}->{draw}\n" if ($report_vars{$report}->{draw});
+            print "$_.type $report_vars{$report}->{type}\n" if ($report_vars{$report}->{type});
+            print "$_.cdef $report_vars{$report}->{cdef}->[$i]\n" if ($report_vars{$report}->{cdef}->[$i]);
+            print "$_.graph $report_vars{$report}->{graph}->[$i]\n" if ($report_vars{$report}->{graph}->[$i]);
+            print "$_.negative $report_vars{$report}->{negative}->[$i]\n" if ($report_vars{$report}->{negative}->[$i]);
+        }
+        return;
+    }
+
+    # Output values for report
+    my %vals = fetchParsedData($report, $parser);
+    foreach (@{$report_vars{$report}->{vars}}) {
+        print "$_.value $vals{$_}\n";
+    }
+}
+
+###################################################################
+# HTTP / CACHING
+###################################################################
+
+# Fetches an html page, parses it into a hash of variables, caches the hash.
+# Usage: fetchParsedData($report, &sub)
+sub fetchParsedData {
+    die if (@_ != 2);
+    my $report = shift;
+    my $parser = shift;
+
+    die "unknown report: $report\n" if (not exists $reports{$report});
+    my $page = $reports{$report}->{url};
+    die "bad url for report: $report\n" if (not defined $reports{$report}->{url});
+
+    my $url = "http://$MODEM_ADDR/$page";
+    my %state = restore_state();
+
+    # Check state cache and rehydrate if not expired.
+    if (exists $state{$url} && $state{"EXPIRES".$url} > time()) {
+        return split('###', $state{$url});
+    }
+
+    # Fetch from modem and parse into a hash.
+    my $content = fetchUrl($url);
+    my %vals = &{$parser}($content);
+
+    # Cache the hash for subsequent report use.
+    $state{"EXPIRES".$url} = time()+60;
+    $state{$url} = join('###', %vals);
+    save_state(%state);
+
+    return %vals;
+}
+
+# Fetch a page from the modem webserver.
+# Usage: fetchUrl($url)
+sub fetchUrl {
+    die if (@_ != 1);
+    my $url = shift;
+    my $ua = initLWP();
+    my $response = $ua->request(HTTP::Request->new('GET',$url));
+    my $content = $response->content;
+    return $content;
+}
+
+# Initialize and return a User Agent
+# Usage: initLWP()
+sub initLWP {
+    my $ua = LWP::UserAgent->new(timeout => 30);
+    $ua->agent('Munin Fetch Bot/9000');
+
+    # Use proxy, if defined.
+    my $proxy = $ENV{proxy} || undef;   # Example: "http://proxy.foo.bar:8080/"
+    if (defined($proxy)) {
+        $ua->proxy(['http'], $proxy);
+    }
+    return $ua;
+}
